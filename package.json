@@ -1,0 +1,47 @@
+{
+  "name": "revtrail",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Open-source, cookieless revenue analytics: a self-hosted DataFast alternative with Polar and Dodo Payments built in. Free on Cloudflare Workers + D1.",
+  "keywords": ["analytics", "web-analytics", "revenue-analytics", "datafast-alternative", "plausible-alternative", "umami-alternative", "cookieless", "privacy", "self-hosted", "cloudflare-workers", "cloudflare-d1", "polar", "dodo-payments"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/deskworthy/revtrail.git"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n api,web \"wrangler dev --port 8787\" \"vite\"",
+    "dev:api": "wrangler dev --port 8787",
+    "dev:web": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "db:migrate:local": "wrangler d1 migrations apply revtrail --local",
+    "db:migrate": "wrangler d1 migrations apply revtrail --remote",
+    "deploy": "vite build && wrangler d1 migrations apply revtrail --remote && wrangler deploy",
+    "seed": "node scripts/seed-demo.mjs && wrangler d1 execute revtrail --local --file .wrangler/seed.sql",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "hono": "^4.13.13"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261023.1",
+    "@types/node": "^22.20.5",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "autoprefixer": "^10.6.1",
+    "concurrently": "^10.0.6",
+    "postcss": "^8.5.31",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^2.15.4",
+    "tailwindcss": "^3.4.19",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.5",
+    "vitest": "^3.2.7",
+    "wrangler": "^4.152.0"
+  }
+}
