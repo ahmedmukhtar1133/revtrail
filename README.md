@@ -55,7 +55,7 @@ comes back after the month turns is counted as a new visitor. Payments are still
 You need a free [Cloudflare account](https://dash.cloudflare.com/sign-up), [Node.js 20+](https://nodejs.org) and Git.
 
 ```bash
-git clone https://github.com/deskworthy/revtrail.git
+git clone https://github.com/ahmedmukhtar1133/revtrail.git
 cd revtrail
 npm install
 npx wrangler login
