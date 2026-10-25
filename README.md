@@ -14,9 +14,9 @@ revenue by source, not just traffic. It sets no cookies, needs no consent banner
 
 | | RevTrail | DataFast | Plausible | Umami | Google Analytics |
 | --- | --- | --- | --- | --- | --- |
-| Revenue by traffic source | Yes | Yes | Revenue goals | Revenue report | Ecommerce setup |
-| Polar integration | Built in | No | No | No | No |
-| Dodo Payments integration | Built in | No | No | No | No |
+| Revenue by traffic source | Yes | Yes | Revenue goals (custom events) | Revenue report (custom events) | Ecommerce setup |
+| Polar integration | Built in | Yes | No (send events yourself) | No (send events yourself) | No |
+| Dodo Payments integration | Built in | Yes | No (send events yourself) | No (send events yourself) | No |
 | Cookies / consent banner | None | Cookies | None | None | Cookies, banner |
 | Open source | MIT | No | AGPL | MIT | No |
 | Hosting cost | Free (Cloudflare free plan) | Paid | Paid, or your server | Paid, or your server | Free |
