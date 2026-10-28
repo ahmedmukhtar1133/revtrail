@@ -4,6 +4,8 @@
   "main": "src/worker/index.ts",
   "compatibility_date": "2025-09-01",
   "observability": { "enabled": true },
+  // Once a day: import Polar orders the webhook missed (only for sites with a Polar access token).
+  "triggers": { "crons": ["17 3 * * *"] },
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",

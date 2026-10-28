@@ -4,7 +4,7 @@ import { cors } from 'hono/cors';
 import { handleEvent } from './collect';
 import { forgetSite, type AppEnv, type Site } from './env';
 import { passwordsMatch, randomId, signToken, verifyToken } from './lib/crypto';
-import { handleDodoWebhook, handleGoalApi, handlePaymentApi, handlePolarWebhook, rematchPayments } from './payments';
+import { handleDodoWebhook, handleGoalApi, handlePaymentApi, handlePolarWebhook, importPolarOrders, rematchPayments, syncAllPolar } from './payments';
 import { breakdown, customers, funnel, makeCtx, overview, visitorProfile, visitors, type FunnelStep } from './stats';
 
 const app = new Hono<AppEnv>();
@@ -113,7 +113,12 @@ function validTimezone(tz: string) {
 }
 
 const mask = (secret: string | null) => (secret ? '••••••••' : null);
-const publicSite = (s: Site) => ({ ...s, dodo_webhook_secret: mask(s.dodo_webhook_secret), polar_webhook_secret: mask(s.polar_webhook_secret) });
+const publicSite = (s: Site) => ({
+  ...s,
+  dodo_webhook_secret: mask(s.dodo_webhook_secret),
+  polar_webhook_secret: mask(s.polar_webhook_secret),
+  polar_access_token: mask(s.polar_access_token),
+});
 
 app.get('/api/sites', async (c) => {
   const now = Date.now();
@@ -149,6 +154,8 @@ app.post('/api/sites', async (c) => {
     api_key: 'rt_' + randomId(16),
     dodo_webhook_secret: null,
     polar_webhook_secret: null,
+    polar_access_token: null,
+    polar_synced_at: null,
     created_at: Date.now(),
   };
   await c.env.DB.prepare(
@@ -182,12 +189,23 @@ app.patch('/api/sites/:id', async (c) => {
   if (typeof b.polar_webhook_secret === 'string' && !b.polar_webhook_secret.includes('•')) {
     next.polar_webhook_secret = b.polar_webhook_secret.trim() || null;
   }
+  const newToken = typeof b.polar_access_token === 'string' && !b.polar_access_token.includes('•');
+  if (newToken) next.polar_access_token = b.polar_access_token!.trim() || null;
   await c.env.DB.prepare(
-    'UPDATE sites SET name = ?, domain = ?, timezone = ?, currency = ?, dodo_webhook_secret = ?, polar_webhook_secret = ? WHERE id = ?',
+    'UPDATE sites SET name = ?, domain = ?, timezone = ?, currency = ?, dodo_webhook_secret = ?, polar_webhook_secret = ?, polar_access_token = ? WHERE id = ?',
   )
-    .bind(next.name, next.domain, next.timezone, next.currency, next.dodo_webhook_secret, next.polar_webhook_secret, site.id)
+    .bind(next.name, next.domain, next.timezone, next.currency, next.dodo_webhook_secret, next.polar_webhook_secret, next.polar_access_token, site.id)
     .run();
   forgetSite(site.id);
+  // A new token imports past orders straight away, so earlier revenue shows up without another click.
+  if (newToken && next.polar_access_token) {
+    try {
+      const imported = await importPolarOrders(c.env.DB, next);
+      return c.json({ ...publicSite({ ...next, polar_synced_at: imported.synced_at }), imported });
+    } catch (e) {
+      return c.json({ ...publicSite(next), import_error: (e as Error).message });
+    }
+  }
   return c.json(publicSite(next));
 });
 
@@ -220,6 +238,13 @@ app.get('/api/sites/:id/breakdown', async (c) => {
   }
 });
 
+app.post('/api/sites/:id/import/polar', async (c) => {
+  try {
+    return c.json(await importPolarOrders(c.env.DB, c.get('site')));
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 400);
+  }
+});
 app.post('/api/sites/:id/rematch', async (c) => c.json(await rematchPayments(c.env.DB, c.get('site'))));
 app.get('/api/sites/:id/customers', async (c) => c.json(await customers(makeCtx(c))));
 app.get('/api/sites/:id/visitors', async (c) => c.json(await visitors(makeCtx(c))));
@@ -264,4 +289,10 @@ app.all('/api/*', (c) => c.json({ error: 'not found' }, 404));
 // Everything else is the dashboard (static files).
 app.all('*', (c) => c.env.ASSETS.fetch(c.req.raw));
 
-export default app;
+export default {
+  fetch: app.fetch,
+  // Daily (wrangler triggers.crons): pull Polar orders the webhook missed.
+  async scheduled(_event: ScheduledController, env: AppEnv['Bindings'], ctx: ExecutionContext) {
+    ctx.waitUntil(syncAllPolar(env.DB));
+  },
+} satisfies ExportedHandler<AppEnv['Bindings']>;

@@ -2,7 +2,9 @@ import { createHmac } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { classify } from '../src/shared/sources';
 import { belongsTo, normalizePath } from '../src/worker/collect';
+import type { Site } from '../src/worker/env';
 import { verifyPolarWebhook, verifyStandardWebhook } from '../src/worker/lib/crypto';
+import { polarOrderPayment } from '../src/worker/payments';
 import { bucketLabels, resolveRange, startOfDay, tzOffset } from '../src/worker/lib/time';
 import { isBot, parseUA } from '../src/worker/lib/ua';
 
@@ -126,5 +128,33 @@ describe('directories and chat apps', () => {
     expect(classify({ referrerDomain: null, ref: 'fazier' })).toMatchObject({ source: 'Fazier', channel: 'Referral' });
     expect(classify({ referrerDomain: 'alternativeto.net' })).toMatchObject({ source: 'AlternativeTo' });
     expect(classify({ referrerDomain: null, ref: 'discord' })).toMatchObject({ source: 'Discord', channel: 'Organic Social' });
+  });
+});
+
+describe('polarOrderPayment', () => {
+  const site = { id: 's1', currency: 'USD' } as Site;
+  it('counts revenue without tax and reads the visitor from reference_id', () => {
+    const p = polarOrderPayment(
+      {
+        id: 'ord_1',
+        created_at: '2026-10-23T20:53:10Z',
+        total_amount: 2688,
+        tax_amount: 188,
+        net_amount: 2500,
+        currency: 'usd',
+        billing_reason: 'purchase',
+        customer_id: 'cus_1',
+        customer: { email: 'Jane@Acme.com', name: 'Jane' },
+        checkout_id: 'CHK_1',
+        metadata: { sku: 'all_apps', reference_id: 'v123' },
+      },
+      site,
+    );
+    expect(p).toMatchObject({ id: 'ord_1', amount: 2500, visitorId: 'v123', email: 'jane@acme.com', checkoutId: 'chk_1', renewal: false });
+    expect(p.ts).toBe(Date.parse('2026-10-23T20:53:10Z'));
+  });
+  it('falls back to total minus tax and spots renewals', () => {
+    const p = polarOrderPayment({ id: 'ord_2', total_amount: 1200, tax_amount: 200, billing_reason: 'subscription_cycle' }, site);
+    expect(p).toMatchObject({ amount: 1000, currency: 'USD', visitorId: null, renewal: true });
   });
 });

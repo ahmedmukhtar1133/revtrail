@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { navigate } from '../App';
 import { Favicon } from '../components/Icons';
 import { buildAiPrompt } from '../lib/aiPrompt';
-import { api, type Site } from '../lib/api';
+import { api, type PolarImport, type Site } from '../lib/api';
 
 function Section({ title, desc, children }: { title: string; desc?: ReactNode; children: ReactNode }) {
   return (
@@ -38,24 +38,42 @@ export function Settings({ siteId }: { siteId: string }) {
   const [form, setForm] = useState<Partial<Site>>({});
   const [saved, setSaved] = useState('');
   const [error, setError] = useState('');
+  const [importing, setImporting] = useState(false);
   const origin = window.location.origin;
 
   useEffect(() => {
     api<Site>(`/api/sites/${siteId}`).then((s) => {
       setSite(s);
-      setForm({ name: s.name, domain: s.domain, timezone: s.timezone, currency: s.currency, dodo_webhook_secret: s.dodo_webhook_secret ?? '', polar_webhook_secret: s.polar_webhook_secret ?? '' });
+      setForm({ name: s.name, domain: s.domain, timezone: s.timezone, currency: s.currency, dodo_webhook_secret: s.dodo_webhook_secret ?? '', polar_webhook_secret: s.polar_webhook_secret ?? '', polar_access_token: s.polar_access_token ?? '' });
     });
   }, [siteId]);
 
   async function save(patch: Partial<Site>, msg = 'Saved') {
     setError('');
     try {
-      const s = await api<Site>(`/api/sites/${siteId}`, { method: 'PATCH', json: patch });
+      const s = await api<Site & { imported?: PolarImport; import_error?: string }>(`/api/sites/${siteId}`, { method: 'PATCH', json: patch });
       setSite(s);
+      if (s.import_error) return setError(`Saved, but the import failed: ${s.import_error}`);
+      if (s.imported) msg = importedMessage(s.imported);
       setSaved(msg);
       setTimeout(() => setSaved(''), 2000);
     } catch (e) {
       setError((e as Error).message);
+    }
+  }
+
+  async function importNow() {
+    setError('');
+    setImporting(true);
+    try {
+      const r = await api<PolarImport>(`/api/sites/${siteId}/import/polar`, { method: 'POST' });
+      setSite((s) => s && { ...s, polar_synced_at: r.synced_at });
+      setSaved(importedMessage(r));
+      setTimeout(() => setSaved(''), 4000);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setImporting(false);
     }
   }
 
@@ -167,6 +185,34 @@ async rewrites() {
             <b>Recommended:</b> set the checkout's <b>success URL</b> to a page on your site with the checkout id, e.g.{' '}
             <code>https://{site.domain}/thanks?checkout_id={'{CHECKOUT_ID}'}</code>. A visit to it links the order to the exact visitor
             even when the reference doesn't come through.
+          </li>
+          <li>
+            <b>Import past orders:</b> in Polar → <b>Settings → Developers</b>, create an organization access token with the{' '}
+            <code>orders:read</code> scope and paste it here. Orders from before the webhook was connected are imported right away, and
+            once a day RevTrail picks up any the webhook missed.
+            <div className="mt-2 flex gap-2">
+              <input
+                className="input font-mono"
+                type="password"
+                placeholder="polar_oat_..."
+                value={form.polar_access_token ?? ''}
+                onChange={(e) => setForm({ ...form, polar_access_token: e.target.value })}
+              />
+              <button className="btn-dark" onClick={() => save({ polar_access_token: form.polar_access_token ?? '' }, 'Access token saved')}>
+                Save
+              </button>
+            </div>
+            {site.polar_access_token && (
+              <div className="mt-2 flex flex-wrap items-center gap-3">
+                <p className="text-xs text-emerald-600">
+                  ✓ Token configured
+                  {site.polar_synced_at ? `, last import ${new Date(site.polar_synced_at).toLocaleString()}` : ''}
+                </p>
+                <button className="btn" disabled={importing} onClick={importNow}>
+                  {importing ? 'Importing…' : 'Import now'}
+                </button>
+              </div>
+            )}
           </li>
         </ol>
       </Section>
@@ -303,6 +349,11 @@ curl -X POST ${origin}/api/v1/goals \\
       </Section>
     </div>
   );
+}
+
+function importedMessage(r: PolarImport) {
+  if (!r.imported && !r.refunds) return `Checked ${r.checked} Polar orders, nothing new`;
+  return `Imported ${r.imported} order${r.imported === 1 ? '' : 's'}${r.refunds ? ` and ${r.refunds} refund${r.refunds === 1 ? '' : 's'}` : ''} from Polar`;
 }
 
 /** One-click prompt for the owner's coding AI, so it can install everything in their codebase. */

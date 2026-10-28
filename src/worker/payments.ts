@@ -304,6 +304,56 @@ export async function handleDodoWebhook(c: Context<AppEnv>) {
   return c.json({ ok: true });
 }
 
+type PolarOrder = Record<string, any>;
+const net = (paid: unknown, tax: unknown) => (Number(paid) || 0) - (Number(tax) || 0);
+
+/** A paid Polar order as a payment. Webhook events and the API list return the same order object. */
+export function polarOrderPayment(order: PolarOrder, site: Site): PaymentInput {
+  const customer = (order.customer ?? {}) as Record<string, unknown>;
+  return {
+    id: String(order.id),
+    provider: 'polar',
+    ts: Date.parse(order.created_at ?? '') || Date.now(),
+    amount: Number(order.net_amount ?? net(order.total_amount, order.tax_amount)) || 0,
+    kind: 'payment',
+    currency: String(order.currency ?? site.currency),
+    visitorId: pickMeta(order.metadata, ['reference_id', 'rt_visitor_id', 'visitor_id']),
+    customerId: str(order.customer_id) ?? str(customer.id),
+    email: str(customer.email)?.toLowerCase() ?? null,
+    name: str(customer.name),
+    subscriptionId: str(order.subscription_id),
+    checkoutId: str(order.checkout_id)?.toLowerCase() ?? null,
+    renewal: order.billing_reason === 'subscription_cycle',
+  };
+}
+
+/** Polar's refunded_amount is the total refunded so far, so one refund row per order is kept up to date. */
+async function recordPolarRefund(db: D1Database, site: Site, order: PolarOrder) {
+  const customer = (order.customer ?? {}) as Record<string, unknown>;
+  const original = await db
+    .prepare('SELECT * FROM payments WHERE id = ? AND site_id = ?')
+    .bind(String(order.id), site.id)
+    .first<{ visitor_id: string | null; session_id: string | null }>();
+  await db
+    .prepare(
+      `INSERT OR REPLACE INTO payments (id, site_id, provider, ts, amount, kind, currency, visitor_id, session_id, customer_id, email, name)
+       VALUES (?, ?, 'polar', ?, ?, 'refund', ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      `${order.id}:refund`,
+      site.id,
+      Date.parse(order.modified_at ?? '') || Date.now(),
+      -Math.abs(net(order.refunded_amount, order.refunded_tax_amount)),
+      String(order.currency ?? site.currency).toUpperCase(),
+      original?.visitor_id ?? null,
+      original?.session_id ?? null,
+      str(order.customer_id),
+      str(customer.email)?.toLowerCase() ?? null,
+      str(customer.name),
+    )
+    .run();
+}
+
 /**
  * Polar webhook: POST /api/webhooks/polar/:siteId, subscribed to order.paid and order.refunded.
  * Revenue is the order's net amount: Polar is the merchant of record and passes tax on, so tax is not
@@ -326,55 +376,80 @@ export async function handlePolarWebhook(c: Context<AppEnv>) {
   );
   if (!ok) return c.json({ error: 'invalid signature' }, 401);
 
-  const event = JSON.parse(body) as { type: string; data: Record<string, any> };
+  const event = JSON.parse(body) as { type: string; data: PolarOrder };
   const order = event.data ?? {};
-  const customer = (order.customer ?? {}) as Record<string, unknown>;
-  const meta = (order.metadata ?? {}) as Record<string, unknown>;
-  const ts = Date.parse(order.created_at ?? '') || Date.now();
-  const currency = String(order.currency ?? site.currency);
-  const net = (paid: unknown, tax: unknown) => (Number(paid) || 0) - (Number(tax) || 0);
-
-  if (event.type === 'order.paid') {
-    await recordPayment(c.env.DB, site, {
-      id: String(order.id),
-      provider: 'polar',
-      ts,
-      amount: Number(order.net_amount ?? net(order.total_amount, order.tax_amount)) || 0,
-      kind: 'payment',
-      currency,
-      visitorId: pickMeta(meta, ['reference_id', 'rt_visitor_id', 'visitor_id']),
-      customerId: str(order.customer_id) ?? str(customer.id),
-      email: str(customer.email)?.toLowerCase() ?? null,
-      name: str(customer.name),
-      subscriptionId: str(order.subscription_id),
-      checkoutId: str(order.checkout_id)?.toLowerCase() ?? null,
-      renewal: order.billing_reason === 'subscription_cycle',
-    });
-  } else if (event.type === 'order.refunded') {
-    const original = await c.env.DB.prepare('SELECT * FROM payments WHERE id = ? AND site_id = ?')
-      .bind(String(order.id), site.id)
-      .first<{ visitor_id: string | null; session_id: string | null }>();
-    // refunded_amount is the total refunded so far, so one row per order is kept up to date.
-    await c.env.DB.prepare(
-      `INSERT OR REPLACE INTO payments (id, site_id, provider, ts, amount, kind, currency, visitor_id, session_id, customer_id, email, name)
-       VALUES (?, ?, 'polar', ?, ?, 'refund', ?, ?, ?, ?, ?, ?)`,
-    )
-      .bind(
-        `${order.id}:refund`,
-        site.id,
-        Date.parse(order.modified_at ?? '') || Date.now(),
-        -Math.abs(net(order.refunded_amount, order.refunded_tax_amount)),
-        currency.toUpperCase(),
-        original?.visitor_id ?? null,
-        original?.session_id ?? null,
-        str(order.customer_id),
-        str(customer.email)?.toLowerCase() ?? null,
-        str(customer.name),
-      )
-      .run();
-  }
+  if (event.type === 'order.paid') await recordPayment(c.env.DB, site, polarOrderPayment(order, site));
+  else if (event.type === 'order.refunded') await recordPolarRefund(c.env.DB, site, order);
   // Every other event type is acknowledged so Polar doesn't retry it.
   return c.json({ ok: true });
+}
+
+const POLAR_APIS = ['https://api.polar.sh', 'https://sandbox-api.polar.sh'];
+const POLAR_MAX_PAGES = 20;
+
+/**
+ * Fetch the site's Polar orders through the API and record the paid and refunded ones: orders from before
+ * the webhook was connected, and any the webhook missed. Safe to repeat: an order already recorded is
+ * skipped, and refund rows are replaced with the current total. A sandbox token is tried on Polar's sandbox.
+ */
+export async function importPolarOrders(db: D1Database, site: Site) {
+  const token = site.polar_access_token;
+  if (!token) throw new Error('Add a Polar access token first');
+  const known = new Set(
+    (await db.prepare("SELECT id FROM payments WHERE site_id = ? AND provider = 'polar'").bind(site.id).all<{ id: string }>()).results.map(
+      (r) => r.id,
+    ),
+  );
+  let base: string | null = null;
+  let imported = 0;
+  let refunds = 0;
+  let checked = 0;
+  for (let page = 1; page <= POLAR_MAX_PAGES; page++) {
+    let res: Response | null = null;
+    const apis: string[] = base ? [base] : POLAR_APIS;
+    for (const api of apis) {
+      res = await fetch(`${api}/v1/orders/?page=${page}&limit=100&sorting=created_at`, {
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      });
+      if (res.status !== 401) {
+        base = api;
+        break;
+      }
+    }
+    if (!res || res.status === 401) throw new Error('Polar rejected the access token');
+    if (res.status === 403) throw new Error('The Polar access token needs the orders:read scope');
+    if (!res.ok) throw new Error(`Polar answered ${res.status}`);
+    const data = (await res.json()) as { items: PolarOrder[]; pagination: { max_page: number } };
+    for (const order of data.items) {
+      checked++;
+      // Pending and void orders were never paid; refunded ones were, and keep paid = true.
+      if (!order.paid) continue;
+      if (!known.has(String(order.id))) {
+        await recordPayment(db, site, polarOrderPayment(order, site));
+        imported++;
+      }
+      if (Number(order.refunded_amount) > 0) {
+        await recordPolarRefund(db, site, order);
+        refunds++;
+      }
+    }
+    if (page >= data.pagination.max_page) break;
+  }
+  const syncedAt = Date.now();
+  await db.prepare('UPDATE sites SET polar_synced_at = ? WHERE id = ?').bind(syncedAt, site.id).run();
+  return { checked, imported, refunds, synced_at: syncedAt };
+}
+
+/** Daily cron: import new Polar orders for every site with a token, as a safety net behind the webhook. */
+export async function syncAllPolar(db: D1Database) {
+  const sites = await db.prepare('SELECT * FROM sites WHERE polar_access_token IS NOT NULL').all<Site>();
+  for (const site of sites.results) {
+    try {
+      await importPolarOrders(db, site);
+    } catch (e) {
+      console.error(`Polar import failed for site ${site.id}: ${(e as Error).message}`);
+    }
+  }
 }
 
 async function siteFromApiKey(c: Context<AppEnv>): Promise<Site | null> {

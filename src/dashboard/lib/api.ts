@@ -31,9 +31,18 @@ export interface Site {
   api_key: string;
   dodo_webhook_secret: string | null;
   polar_webhook_secret: string | null;
+  polar_access_token: string | null;
+  polar_synced_at: number | null;
   created_at: number;
   visitors24h?: number;
   online?: number;
+}
+
+export interface PolarImport {
+  checked: number;
+  imported: number;
+  refunds: number;
+  synced_at: number;
 }
 
 export interface Kpis {

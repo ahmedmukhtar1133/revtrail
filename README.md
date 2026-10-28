@@ -105,6 +105,9 @@ If you outgrow it, Cloudflare's Workers Paid plan is $5 a month.
 3. Recommended: set the checkout's success URL to a page on your site with the checkout id, such as
    `https://yoursite.com/thanks?checkout_id={CHECKOUT_ID}`. A visit to it links the order to the exact visitor even when the
    reference is lost.
+4. Import past orders: create a Polar organization access token with the `orders:read` scope and paste it into the site's
+   settings. Orders from before the webhook was connected are imported at once, and a daily cron picks up any order or refund
+   the webhook missed. Imported orders go through the same matching, so ones that predate the script stay unattributed.
 
 Revenue is the order's net amount: Polar is the merchant of record and pays the tax, so tax is not your revenue. Refunds are
 subtracted, and subscription renewals are recognised.
