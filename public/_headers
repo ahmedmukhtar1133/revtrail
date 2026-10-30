@@ -1,3 +1,6 @@
 /js/script.js
   Access-Control-Allow-Origin: *
   Cache-Control: public, max-age=3600
+
+/*
+  X-Robots-Tag: noindex, nofollow
