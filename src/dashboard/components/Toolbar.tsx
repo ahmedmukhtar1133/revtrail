@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { navigate } from '../App';
 import type { Overview, Query, Site } from '../lib/api';
 import { dayInTz } from '../lib/format';
+import { BackButton } from './BackButton';
 import { Favicon } from './Icons';
 
 export const PERIODS: { value: string; label: string }[] = [
@@ -63,6 +64,7 @@ export function Toolbar({
   update,
   overview,
   onRefresh,
+  onLive,
   loading,
 }: {
   site: Site;
@@ -71,6 +73,7 @@ export function Toolbar({
   update: (p: Partial<Query>) => void;
   overview: Overview | null;
   onRefresh: () => void;
+  onLive: () => void;
   loading: boolean;
 }) {
   const [from, setFrom] = useState(q.from ?? '');
@@ -96,6 +99,7 @@ export function Toolbar({
 
   return (
     <div className="flex flex-wrap items-center gap-2">
+      <BackButton label="" className="btn h-11 w-11 justify-center px-0" />
       <Dropdown
         button={
           <button className="btn h-11 px-4 text-base">
@@ -205,6 +209,10 @@ export function Toolbar({
           ))
         }
       </Dropdown>
+
+      <button className="btn h-11 px-4 text-base" onClick={onLive} title="Live map (M)">
+        <span className="h-2 w-2 animate-pulse rounded-full bg-green-500" /> Live
+      </button>
 
       <button className="btn h-11 w-11 px-0" onClick={onRefresh} aria-label="Refresh">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={loading ? 'animate-spin' : ''}>

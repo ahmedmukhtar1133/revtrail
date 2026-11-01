@@ -2,10 +2,11 @@ import { Hono, type Context, type Next } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import { cors } from 'hono/cors';
 import { handleEvent } from './collect';
+import { rememberOwnerDevice } from './owner';
 import { forgetSite, type AppEnv, type Site } from './env';
 import { passwordsMatch, randomId, signToken, verifyToken } from './lib/crypto';
-import { handleDodoWebhook, handleGoalApi, handlePaymentApi, handlePolarWebhook, importPolarOrders, rematchPayments, syncAllPolar } from './payments';
-import { breakdown, customers, funnel, makeCtx, overview, visitorProfile, visitors, type FunnelStep } from './stats';
+import { handleDodoWebhook, handleGoalApi, handlePaymentApi, handlePolarWebhook, handleStripeWebhook, importPolarOrders, learnDodoProducts, rematchPayments, syncAllPolar } from './payments';
+import { breakdown, customers, funnel, makeCtx, overview, realtime, sparklines, visitorProfile, visitors, type FunnelStep } from './stats';
 
 const app = new Hono<AppEnv>();
 const AUTH_COOKIE = 'rt_auth';
@@ -19,6 +20,7 @@ app.use('/api/event', cors({ origin: '*', allowMethods: ['POST', 'OPTIONS'], max
 app.post('/api/event', handleEvent);
 app.post('/api/webhooks/dodo/:siteId', handleDodoWebhook);
 app.post('/api/webhooks/polar/:siteId', handlePolarWebhook);
+app.post('/api/webhooks/stripe/:siteId', handleStripeWebhook);
 app.post('/api/v1/payments', handlePaymentApi);
 app.post('/api/v1/goals', handleGoalApi);
 
@@ -74,7 +76,11 @@ app.post('/api/auth/logout', (c) => {
   return c.json({ ok: true });
 });
 
-app.get('/api/auth/me', async (c) => c.json({ loggedIn: await isLoggedIn(c) }));
+app.get('/api/auth/me', async (c) => {
+  const loggedIn = await isLoggedIn(c);
+  if (loggedIn) c.executionCtx.waitUntil(rememberOwnerDevice(c).catch(() => {}));
+  return c.json({ loggedIn });
+});
 
 // ---------- dashboard API (login required)
 
@@ -112,11 +118,12 @@ function validTimezone(tz: string) {
   }
 }
 
-const mask = (secret: string | null) => (secret ? '••••••••' : null);
+const mask = (secret: string | null | undefined) => (secret ? '••••••••' : null);
 const publicSite = (s: Site) => ({
   ...s,
   dodo_webhook_secret: mask(s.dodo_webhook_secret),
   polar_webhook_secret: mask(s.polar_webhook_secret),
+  stripe_webhook_secret: mask(s.stripe_webhook_secret),
   polar_access_token: mask(s.polar_access_token),
 });
 
@@ -138,6 +145,13 @@ app.get('/api/sites', async (c) => {
       online: by.get(s.id)?.online ?? 0,
     })),
   );
+});
+
+// Every site's totals and sparkline for the all-websites view.
+app.use('/api/sites-overview', requireAuth);
+app.get('/api/sites-overview', async (c) => {
+  const rows = await c.env.DB.prepare('SELECT id FROM sites').all<{ id: string }>();
+  return c.json(await sparklines(c.env.DB, rows.results.map((r) => r.id), c.req.query('period') ?? '30d'));
 });
 
 app.post('/api/sites', async (c) => {
@@ -189,12 +203,25 @@ app.patch('/api/sites/:id', async (c) => {
   if (typeof b.polar_webhook_secret === 'string' && !b.polar_webhook_secret.includes('•')) {
     next.polar_webhook_secret = b.polar_webhook_secret.trim() || null;
   }
+  if (typeof b.stripe_webhook_secret === 'string' && !b.stripe_webhook_secret.includes('•')) {
+    next.stripe_webhook_secret = b.stripe_webhook_secret.trim() || null;
+  }
   const newToken = typeof b.polar_access_token === 'string' && !b.polar_access_token.includes('•');
   if (newToken) next.polar_access_token = b.polar_access_token!.trim() || null;
   await c.env.DB.prepare(
-    'UPDATE sites SET name = ?, domain = ?, timezone = ?, currency = ?, dodo_webhook_secret = ?, polar_webhook_secret = ?, polar_access_token = ? WHERE id = ?',
+    'UPDATE sites SET name = ?, domain = ?, timezone = ?, currency = ?, dodo_webhook_secret = ?, polar_webhook_secret = ?, polar_access_token = ?, stripe_webhook_secret = ? WHERE id = ?',
   )
-    .bind(next.name, next.domain, next.timezone, next.currency, next.dodo_webhook_secret, next.polar_webhook_secret, next.polar_access_token, site.id)
+    .bind(
+      next.name,
+      next.domain,
+      next.timezone,
+      next.currency,
+      next.dodo_webhook_secret,
+      next.polar_webhook_secret,
+      next.polar_access_token,
+      next.stripe_webhook_secret ?? null,
+      site.id,
+    )
     .run();
   forgetSite(site.id);
   // A new token imports past orders straight away, so earlier revenue shows up without another click.
@@ -230,6 +257,7 @@ app.delete('/api/sites/:id', async (c) => {
 
 app.get('/api/sites/:id/overview', async (c) => c.json(await overview(makeCtx(c))));
 
+app.get('/api/sites/:id/realtime', async (c) => c.json(await realtime(c.env.DB, c.get('site'))));
 app.get('/api/sites/:id/breakdown', async (c) => {
   try {
     return c.json(await breakdown(makeCtx(c), c.req.query('dim') ?? 'source', Number(c.req.query('limit')) || 100));
@@ -244,6 +272,22 @@ app.post('/api/sites/:id/import/polar', async (c) => {
   } catch (e) {
     return c.json({ error: (e as Error).message }, 400);
   }
+});
+// Dodo payments that couldn't be placed on a site yet, grouped by product.
+app.get('/api/sites/:id/pending-payments', async (c) => {
+  const r = await c.env.DB.prepare(
+    `SELECT product_id, COUNT(*) AS count, SUM(json_extract(payload, '$.amount')) AS amount, MAX(json_extract(payload, '$.currency')) AS currency
+     FROM pending_payments WHERE site_id = ? GROUP BY product_id ORDER BY MAX(ts) DESC`,
+  )
+    .bind(c.get('site').id)
+    .all();
+  return c.json(r.results);
+});
+app.post('/api/sites/:id/pending-payments', async (c) => {
+  const b = await c.req.json<{ product_id?: string }>().catch(() => ({}) as { product_id?: string });
+  if (!b.product_id || !/^pdt_[\w-]+$/.test(b.product_id)) return c.json({ error: 'product_id is required' }, 400);
+  await learnDodoProducts(c.env.DB, c.get('site'), [b.product_id]);
+  return c.json({ ok: true });
 });
 app.post('/api/sites/:id/rematch', async (c) => c.json(await rematchPayments(c.env.DB, c.get('site'))));
 app.get('/api/sites/:id/customers', async (c) => c.json(await customers(makeCtx(c))));

@@ -3,8 +3,8 @@ import { describe, expect, it } from 'vitest';
 import { classify } from '../src/shared/sources';
 import { belongsTo, normalizePath } from '../src/worker/collect';
 import type { Site } from '../src/worker/env';
-import { verifyPolarWebhook, verifyStandardWebhook } from '../src/worker/lib/crypto';
-import { polarOrderPayment } from '../src/worker/payments';
+import { verifyPolarWebhook, verifyStandardWebhook, verifyStripeWebhook } from '../src/worker/lib/crypto';
+import { dodoProductOfLink, polarOrderPayment } from '../src/worker/payments';
 import { bucketLabels, resolveRange, startOfDay, tzOffset } from '../src/worker/lib/time';
 import { isBot, parseUA } from '../src/worker/lib/ua';
 
@@ -156,5 +156,29 @@ describe('polarOrderPayment', () => {
   it('falls back to total minus tax and spots renewals', () => {
     const p = polarOrderPayment({ id: 'ord_2', total_amount: 1200, tax_amount: 200, billing_reason: 'subscription_cycle' }, site);
     expect(p).toMatchObject({ amount: 1000, currency: 'USD', visitorId: null, renewal: true });
+  });
+});
+
+describe('stripe webhooks', () => {
+  const secret = 'whsec_test_secret';
+  const body = '{"type":"checkout.session.completed"}';
+  const now = 1_790_000_000_000;
+  const t = String(now / 1000);
+  const sig = createHmac('sha256', secret).update(`${t}.${body}`).digest('hex');
+  it('accepts a valid signature, also among several v1 values', async () => {
+    expect(await verifyStripeWebhook(secret, `t=${t},v1=${sig}`, body, now)).toBe(true);
+    expect(await verifyStripeWebhook(secret, `t=${t},v1=deadbeef,v1=${sig}`, body, now)).toBe(true);
+  });
+  it('rejects tampering, a missing header and stale timestamps', async () => {
+    expect(await verifyStripeWebhook(secret, `t=${t},v1=${sig}`, body + ' ', now)).toBe(false);
+    expect(await verifyStripeWebhook(secret, null, body, now)).toBe(false);
+    expect(await verifyStripeWebhook(secret, `t=${t},v1=${sig}`, body, now + 10 * 60_000)).toBe(false);
+  });
+});
+
+describe('dodo products', () => {
+  it('reads the product of a checkout link', () => {
+    expect(dodoProductOfLink('https://checkout.dodopayments.com/buy/pdt_abc123?quantity=1')).toBe('pdt_abc123');
+    expect(dodoProductOfLink('https://polar.sh/checkout/x')).toBeNull();
   });
 });

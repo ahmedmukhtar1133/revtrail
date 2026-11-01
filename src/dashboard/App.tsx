@@ -7,7 +7,7 @@ import { Settings } from './pages/Settings';
 import { Sites } from './pages/Sites';
 
 export function navigate(to: string) {
-  window.history.pushState(null, '', to);
+  window.history.pushState({ app: true }, '', to);
   window.dispatchEvent(new PopStateEvent('popstate'));
 }
 

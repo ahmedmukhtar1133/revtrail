@@ -1,14 +1,9 @@
 import type { Context } from 'hono';
 import { getSite, type AppEnv, type Site } from './env';
-import { verifyPolarWebhook, verifyStandardWebhook } from './lib/crypto';
+import { verifyPolarWebhook, verifyStandardWebhook, verifyStripeWebhook } from './lib/crypto';
+import { currencyDecimals } from '../shared/currency';
 
-export function currencyDecimals(currency: string): number {
-  try {
-    return new Intl.NumberFormat('en', { style: 'currency', currency }).resolvedOptions().maximumFractionDigits ?? 2;
-  } catch {
-    return 2;
-  }
-}
+export { currencyDecimals };
 
 interface PaymentInput {
   id: string;
@@ -24,6 +19,7 @@ interface PaymentInput {
   name?: string | null;
   subscriptionId?: string | null;
   checkoutId?: string | null;
+  productId?: string | null;
   renewal?: boolean;
 }
 
@@ -109,7 +105,7 @@ async function matchByTiming(db: D1Database, site: Site, p: PaymentInput): Promi
     .prepare(
       `SELECT e.visitor_id, MAX(e.ts) AS last_click FROM events e
        WHERE e.site_id = ? AND e.ts BETWEEN ? AND ?
-         AND ((e.type = 'outbound' AND (e.name LIKE '%dodopayments.com%' OR e.name LIKE '%polar.sh%'))
+         AND ((e.type = 'outbound' AND (e.name LIKE '%dodopayments.com%' OR e.name LIKE '%polar.sh%' OR e.name LIKE '%buy.stripe.com%' OR e.name LIKE '%checkout.stripe.com%'))
               OR (e.type = 'goal' AND (e.name LIKE '%checkout%' OR e.name LIKE '%buy%' OR e.name LIKE '%purchase%')))
          AND NOT EXISTS (SELECT 1 FROM payments o WHERE o.site_id = e.site_id AND o.visitor_id = e.visitor_id
                          AND o.kind = 'payment' AND o.id != ? AND o.ts BETWEEN ? AND ?)
@@ -146,13 +142,23 @@ async function matchByTiming(db: D1Database, site: Site, p: PaymentInput): Promi
   };
 }
 
+// Seen before (a retry, or Stripe's invoice.paid arriving before checkout.session.completed): fill in what
+// was missing, and let checkout metadata win over a weaker match.
+const BETTER = `(payments.visitor_id IS NULL OR excluded.matched_by = 'metadata')`;
+
 export async function recordPayment(db: D1Database, site: Site, p: PaymentInput) {
   const { visitorId, sessionId, renewal, matchedBy } = await attribute(db, site, p);
   const stmts = [
     db
       .prepare(
-        `INSERT OR IGNORE INTO payments (id, site_id, provider, ts, amount, kind, currency, visitor_id, session_id, customer_id, email, name, renewal, matched_by, subscription_id, checkout_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO payments (id, site_id, provider, ts, amount, kind, currency, visitor_id, session_id, customer_id, email, name, renewal, matched_by, subscription_id, checkout_id, product_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (id) DO UPDATE SET
+           visitor_id = CASE WHEN ${BETTER} THEN COALESCE(excluded.visitor_id, payments.visitor_id) ELSE payments.visitor_id END,
+           session_id = CASE WHEN ${BETTER} THEN COALESCE(excluded.session_id, payments.session_id) ELSE payments.session_id END,
+           matched_by = CASE WHEN ${BETTER} THEN COALESCE(excluded.matched_by, payments.matched_by) ELSE payments.matched_by END,
+           checkout_id = COALESCE(payments.checkout_id, excluded.checkout_id)
+         WHERE payments.site_id = excluded.site_id`,
       )
       .bind(
         p.id,
@@ -171,6 +177,7 @@ export async function recordPayment(db: D1Database, site: Site, p: PaymentInput)
         matchedBy,
         p.subscriptionId ?? null,
         p.checkoutId ?? null,
+        p.productId ?? null,
       ),
   ];
   // A payment tells us who an anonymous visitor really is.
@@ -233,6 +240,154 @@ function pickMeta(meta: Record<string, unknown> | undefined, keys: string[]): st
 }
 
 /** Dodo Payments webhook: POST /api/webhooks/dodo/:siteId */
+/** Stripe webhook: POST /api/webhooks/stripe/:siteId */
+export async function handleStripeWebhook(c: Context<AppEnv>) {
+  const site = await getSite(c.env.DB, c.req.param('siteId')!);
+  if (!site) return c.json({ error: 'unknown site' }, 404);
+  if (!site.stripe_webhook_secret) return c.json({ error: 'webhook secret not configured for this site' }, 400);
+
+  const body = await c.req.text();
+  if (!(await verifyStripeWebhook(site.stripe_webhook_secret, c.req.header('stripe-signature') ?? null, body))) {
+    return c.json({ error: 'invalid signature' }, 401);
+  }
+
+  const event = JSON.parse(body) as { type: string; data: { object: Record<string, any> } };
+  const o = event.data?.object ?? {};
+  const ts = (Number(o.created) || Date.now() / 1000) * 1000;
+  // Older API versions put these on the object, newer ones under `parent`.
+  const subscriptionId = str(o.subscription) ?? str(o.parent?.subscription_details?.subscription);
+
+  if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
+    if (o.payment_status !== 'paid') return c.json({ ok: true, ignored: 'not paid yet' });
+    // Payment links can't carry metadata, so the script puts the visitor in client_reference_id: rt_<visitor id>.
+    const ref = /^rt_([\w-]+)$/.exec(o.client_reference_id ?? '');
+    await recordPayment(c.env.DB, site, {
+      // A subscription's first invoice also arrives as invoice.paid; the same id makes them one payment.
+      id: (o.mode === 'subscription' ? str(o.invoice) : str(o.payment_intent)) ?? String(o.id),
+      provider: 'stripe',
+      ts,
+      amount: Number(o.amount_total) || 0,
+      kind: 'payment',
+      currency: String(o.currency ?? site.currency),
+      visitorId: pickMeta(o.metadata, ['rt_visitor_id', 'visitor_id', 'revtrail_visitor_id']) ?? ref?.[1],
+      sessionId: pickMeta(o.metadata, ['rt_session_id', 'session_id', 'revtrail_session_id']),
+      customerId: str(o.customer),
+      email: str(o.customer_details?.email)?.toLowerCase() ?? null,
+      name: str(o.customer_details?.name),
+      subscriptionId,
+      checkoutId: str(o.id),
+    });
+  } else if (event.type === 'invoice.paid') {
+    // One-time Checkout payments are counted above; here only subscription invoices (first payment and renewals).
+    if (!String(o.billing_reason).startsWith('subscription') || !(Number(o.amount_paid) > 0)) {
+      return c.json({ ok: true, ignored: 'not a subscription payment' });
+    }
+    await recordPayment(c.env.DB, site, {
+      id: String(o.id),
+      provider: 'stripe',
+      ts,
+      amount: Number(o.amount_paid),
+      kind: 'payment',
+      currency: String(o.currency ?? site.currency),
+      customerId: str(o.customer),
+      email: str(o.customer_email)?.toLowerCase() ?? null,
+      name: str(o.customer_name),
+      subscriptionId,
+      renewal: o.billing_reason === 'subscription_cycle',
+    });
+  } else if (event.type === 'charge.refunded') {
+    const original =
+      (await c.env.DB.prepare('SELECT * FROM payments WHERE site_id = ? AND id IN (?, ?)')
+        .bind(site.id, str(o.payment_intent) ?? '', str(o.invoice) ?? '')
+        .first<{ id: string; visitor_id: string | null; session_id: string | null }>()) ??
+      // Newer API versions don't link a charge to its invoice; fall back to the customer's latest payment.
+      (await c.env.DB.prepare("SELECT * FROM payments WHERE site_id = ? AND customer_id = ? AND kind = 'payment' ORDER BY ts DESC LIMIT 1")
+        .bind(site.id, str(o.customer) ?? '')
+        .first<{ id: string; visitor_id: string | null; session_id: string | null }>());
+    if (!original) return c.json({ ok: true, ignored: 'unknown payment' });
+    // amount_refunded is the running total, so a second partial refund replaces the row.
+    await c.env.DB.prepare(
+      `INSERT OR REPLACE INTO payments (id, site_id, provider, ts, amount, kind, currency, visitor_id, session_id, customer_id, email, name)
+       VALUES (?, ?, 'stripe', ?, ?, 'refund', ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        `${o.id}:refund`,
+        site.id,
+        Date.now(),
+        -Math.abs(Number(o.amount_refunded) || 0),
+        String(o.currency ?? site.currency).toUpperCase(),
+        original.visitor_id,
+        original.session_id,
+        str(o.customer),
+        str(o.billing_details?.email)?.toLowerCase() ?? null,
+        str(o.billing_details?.name),
+      )
+      .run();
+  }
+  // Every other event type is acknowledged so Stripe doesn't retry it.
+  return c.json({ ok: true });
+}
+
+const DODO_PRODUCT = /dodopayments\.com\/buy\/(pdt_[\w-]+)/;
+
+/** The Dodo product of a checkout link (https://checkout.dodopayments.com/buy/pdt_...), if it is one. */
+export function dodoProductOfLink(url: string): string | null {
+  return DODO_PRODUCT.exec(url)?.[1] ?? null;
+}
+
+/**
+ * Does this Dodo payment belong to this site? true = yes, false = another site's, null = can't tell yet.
+ * Dodo sends every payment in the account to every webhook, so this is decided per product. `learn` is
+ * set when the payment itself proves the product is this site's.
+ */
+async function ownsDodoPayment(db: D1Database, site: Site, products: string[], visitorId: string | null) {
+  // A visitor id is made for one site, so it names the site outright.
+  if (visitorId) {
+    const r = await db.prepare('SELECT site_id FROM visitors WHERE id = ? LIMIT 10').bind(visitorId).all<{ site_id: string }>();
+    const sites = r.results.map((x) => x.site_id);
+    if (sites.includes(site.id)) return { owned: true, learn: true };
+    if (sites.length) return { owned: false, learn: false };
+  }
+  if (products.length) {
+    const r = await db
+      .prepare(`SELECT site_id FROM dodo_products WHERE product_id IN (${products.map(() => '?').join(',')})`)
+      .bind(...products)
+      .all<{ site_id: string }>();
+    const sites = r.results.map((x) => x.site_id);
+    if (sites.includes(site.id)) return { owned: true, learn: false };
+    if (sites.length) return { owned: false, learn: false };
+  }
+  // A new product: it's this site's if no other site takes Dodo payments.
+  const other = await db.prepare('SELECT 1 FROM sites WHERE id != ? AND dodo_webhook_secret IS NOT NULL LIMIT 1').bind(site.id).first();
+  return { owned: other ? null : true, learn: !other };
+}
+
+/**
+ * Remember that these products (or this one payment) belong to the site: count its waiting payments,
+ * and drop the copies other sites were holding.
+ */
+export async function learnDodoProducts(db: D1Database, site: Site, products: string[], paymentId: string | null = null) {
+  if (paymentId) {
+    const row = await db
+      .prepare('SELECT product_id FROM pending_payments WHERE site_id = ? AND payment_id = ?')
+      .bind(site.id, paymentId)
+      .first<{ product_id: string | null }>();
+    if (!row && !products.length) return;
+    if (row?.product_id) products = [...products, row.product_id];
+  }
+  if (!products.length && !paymentId) return;
+  const ph = products.map(() => '?').join(',') || "''";
+  const pending = await db
+    .prepare(`SELECT payload FROM pending_payments WHERE site_id = ? AND (product_id IN (${ph}) OR payment_id = ?)`)
+    .bind(site.id, ...products, paymentId ?? '')
+    .all<{ payload: string }>();
+  await db.batch([
+    ...products.map((id) => db.prepare('INSERT OR IGNORE INTO dodo_products (product_id, site_id) VALUES (?, ?)').bind(id, site.id)),
+    db.prepare(`DELETE FROM pending_payments WHERE product_id IN (${ph}) OR payment_id = ?`).bind(...products, paymentId ?? ''),
+  ]);
+  for (const row of pending.results) await recordPayment(db, site, JSON.parse(row.payload) as PaymentInput);
+}
+
 export async function handleDodoWebhook(c: Context<AppEnv>) {
   const site = await getSite(c.env.DB, c.req.param('siteId')!);
   if (!site) return c.json({ error: 'unknown site' }, 404);
@@ -257,13 +412,14 @@ export async function handleDodoWebhook(c: Context<AppEnv>) {
   const ts = Date.parse(data.created_at ?? event.timestamp ?? '') || Date.now();
 
   if (event.type === 'payment.succeeded') {
+    const products: string[] = Array.isArray(data.product_cart) ? data.product_cart.map((p: any) => p?.product_id).filter(Boolean) : [];
     let amount = Number(data.total_amount) || 0;
     let currency = String(data.currency ?? site.currency);
     if (currency.toUpperCase() !== site.currency && str(data.settlement_currency)?.toUpperCase() === site.currency) {
       amount = Number(data.settlement_amount) || amount;
       currency = data.settlement_currency;
     }
-    await recordPayment(c.env.DB, site, {
+    const payment: PaymentInput = {
       id: String(data.payment_id),
       provider: 'dodo',
       ts,
@@ -276,12 +432,28 @@ export async function handleDodoWebhook(c: Context<AppEnv>) {
       email: str(customer.email)?.toLowerCase() ?? null,
       name: str(customer.name),
       subscriptionId: str(data.subscription_id) ?? (Array.isArray(data.subscription_ids) ? str(data.subscription_ids[0]) : null),
-    });
+      productId: products[0] ?? null,
+    };
+    const { owned, learn } = await ownsDodoPayment(c.env.DB, site, products, payment.visitorId ?? null);
+    if (owned === false) return c.json({ ok: true, ignored: "another site's product" });
+    if (owned === null) {
+      await c.env.DB.prepare('INSERT OR IGNORE INTO pending_payments (site_id, payment_id, product_id, ts, payload) VALUES (?, ?, ?, ?, ?)')
+        .bind(site.id, payment.id, payment.productId, ts, JSON.stringify(payment))
+        .run();
+      return c.json({ ok: true, pending: 'unknown product' });
+    }
+    await recordPayment(c.env.DB, site, payment);
+    if (learn) await learnDodoProducts(c.env.DB, site, products);
   } else if (event.type === 'refund.succeeded') {
     const original = await c.env.DB.prepare('SELECT * FROM payments WHERE id = ? AND site_id = ?')
       .bind(String(data.payment_id), site.id)
       .first<{ visitor_id: string | null; session_id: string | null; currency: string; amount: number }>();
-    const amount = Number(data.amount) || original?.amount || 0;
+    // A refund of a payment this site never counted: another site's, or one still waiting to be placed.
+    if (!original) {
+      await c.env.DB.prepare('DELETE FROM pending_payments WHERE site_id = ? AND payment_id = ?').bind(site.id, String(data.payment_id)).run();
+      return c.json({ ok: true, ignored: 'unknown payment' });
+    }
+    const amount = Number(data.amount) || original.amount || 0;
     await c.env.DB.prepare(
       `INSERT OR IGNORE INTO payments (id, site_id, provider, ts, amount, kind, currency, visitor_id, session_id, customer_id, email, name)
        VALUES (?, ?, 'dodo', ?, ?, 'refund', ?, ?, ?, ?, ?, ?)`,

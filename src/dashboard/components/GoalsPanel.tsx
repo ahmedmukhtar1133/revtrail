@@ -1,14 +1,16 @@
 import { useState } from 'react';
+import { usePref } from '../lib/prefs';
 import { api, qs, type BreakdownRow } from '../lib/api';
 import { useDash } from '../lib/context';
-import { countryName, fmtAgo, fmtDateTime, fmtDuration, fmtNumber, fmtPct, shortId } from '../lib/format';
+import { displayName } from '../../shared/names';
+import { countryName, fmtAgo, fmtDateTime, fmtDuration, fmtNumber, fmtPct } from '../lib/format';
 import { useApi } from '../lib/useApi';
 import { Avatar, BrowserIcon, DeviceIcon, Flag, OSIcon, SourceIcon } from './Icons';
 
 type Tab = 'goal' | 'funnel' | 'user' | 'journey';
 
 export function GoalsPanel({ totalVisitors }: { totalVisitors: number }) {
-  const [tab, setTab] = useState<Tab>('journey');
+  const [tab, setTab] = usePref<Tab>('rt_tab_goals', 'journey');
   const [search, setSearch] = useState('');
   return (
     <div className="card p-3">
@@ -213,7 +215,7 @@ function VisitorCell({ id, name, email, country, city, device, os, browser, badg
       <Avatar id={id} size={44} />
       <div className="min-w-0">
         <div className="flex items-center gap-2">
-          <span className="truncate font-medium">{name || email || `Visitor ${shortId(id)}`}</span>
+          <span className="truncate font-medium">{displayName(id, name, email)}</span>
           {badge}
         </div>
         <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-sm text-stone-500">

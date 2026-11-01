@@ -2,8 +2,23 @@
   "name": "revtrail",
   "version": "0.1.0",
   "private": true,
-  "description": "Open-source, cookieless revenue analytics: a self-hosted DataFast alternative with Polar and Dodo Payments built in. Free on Cloudflare Workers + D1.",
-  "keywords": ["analytics", "web-analytics", "revenue-analytics", "datafast-alternative", "plausible-alternative", "umami-alternative", "cookieless", "privacy", "self-hosted", "cloudflare-workers", "cloudflare-d1", "polar", "dodo-payments"],
+  "description": "Open-source, cookieless revenue analytics: a self-hosted DataFast alternative with Polar, Dodo Payments and Stripe built in. Free on Cloudflare Workers + D1.",
+  "keywords": [
+    "analytics",
+    "web-analytics",
+    "revenue-analytics",
+    "datafast-alternative",
+    "plausible-alternative",
+    "umami-alternative",
+    "cookieless",
+    "privacy",
+    "self-hosted",
+    "cloudflare-workers",
+    "cloudflare-d1",
+    "polar",
+    "dodo-payments",
+    "stripe"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -24,7 +39,8 @@
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
-    "hono": "^4.13.13"
+    "hono": "^4.13.13",
+    "maplibre-gl": "^5.24.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261023.1",

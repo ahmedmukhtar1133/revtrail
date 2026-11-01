@@ -2,8 +2,9 @@ import type { Context } from 'hono';
 import { classify } from '../shared/sources';
 import { getSite, type AppEnv, type Site } from './env';
 import { isBot, parseUA } from './lib/ua';
+import { isOwnerVisit } from './owner';
 import { sessionId, visitorId } from './lib/visitor';
-import { creditedSessionSql } from './payments';
+import { creditedSessionSql, dodoProductOfLink, learnDodoProducts } from './payments';
 
 const TYPES = new Set(['pageview', 'goal', 'outbound', 'ping', 'identify']);
 const MAX_PING_MS = 10 * 60_000;
@@ -63,6 +64,8 @@ export async function handleEvent(c: Context<AppEnv>) {
 
   const site = await getSite(c.env.DB, body.w);
   if (!site) return c.body(null, 404);
+  // The admin checking their own site would otherwise show up as visitors and "online".
+  if (await isOwnerVisit(c)) return c.body(null, 202);
 
   let url: URL;
   try {
@@ -82,7 +85,7 @@ export async function handleEvent(c: Context<AppEnv>) {
 }
 
 /** The visitor's IP address, used only inside the visitor hash and never stored. */
-function clientIp(c: Context<AppEnv>): string {
+export function clientIp(c: Context<AppEnv>): string {
   // Proxied through Vercel the connecting address is Vercel's, so take the visitor's from its header.
   if (c.req.header('x-vercel-ip-country')) {
     const fwd = c.req.header('x-forwarded-for')?.split(',')[0]?.trim();
@@ -95,6 +98,14 @@ export interface Geo {
   country: string | null;
   region: string | null;
   city: string | null;
+  lat: number | null;
+  lon: number | null;
+}
+
+/** City-level coordinates, rounded to 2 decimals (~1 km) so no precise location is ever stored. */
+function coord(v: unknown, max: number): number | null {
+  const n = typeof v === 'number' ? v : parseFloat(String(v ?? ''));
+  return Number.isFinite(n) && Math.abs(n) <= max ? Math.round(n * 100) / 100 : null;
 }
 
 /**
@@ -111,10 +122,22 @@ function geoOf(c: Context<AppEnv>): Geo {
     }
   };
   if (h('x-vercel-ip-country')) {
-    return { country: h('x-vercel-ip-country'), region: h('x-vercel-ip-country-region'), city: h('x-vercel-ip-city') };
+    return {
+      country: h('x-vercel-ip-country'),
+      region: h('x-vercel-ip-country-region'),
+      city: h('x-vercel-ip-city'),
+      lat: coord(h('x-vercel-ip-latitude'), 90),
+      lon: coord(h('x-vercel-ip-longitude'), 180),
+    };
   }
   const cf = (c.req.raw as { cf?: IncomingRequestCfProperties }).cf;
-  return { country: (cf?.country as string) ?? null, region: (cf?.region as string) ?? null, city: (cf?.city as string) ?? null };
+  return {
+    country: (cf?.country as string) ?? null,
+    region: (cf?.region as string) ?? null,
+    city: (cf?.city as string) ?? null,
+    lat: coord(cf?.latitude, 90),
+    lon: coord(cf?.longitude, 180),
+  };
 }
 
 export async function ingest(
@@ -188,6 +211,11 @@ export async function ingest(
     );
   }
   await db.batch(stmts);
+
+  // A link to a Dodo checkout, or a buyer back on the return page, tells which site a product belongs to.
+  const product = t === 'outbound' ? dodoProductOfLink(String(body.n ?? '')) : null;
+  const paid = t === 'pageview' ? url.searchParams.get('payment_id') : null;
+  if (product || (paid && /^pay_[\w-]{4,64}$/.test(paid))) await learnDodoProducts(db, site, product ? [product] : [], paid);
 }
 
 /**
@@ -198,8 +226,15 @@ function claimPayment(db: D1Database, siteId: string, vid: string, url: URL, now
   const q = url.searchParams;
   const dodo = q.get('payment_id') ?? q.get('subscription_id');
   const polar = q.get('checkout_id');
+  const stripe = q.get('session_id');
   const paymentId =
-    dodo && /^(pay|sub)_[\w-]{4,64}$/.test(dodo) ? dodo : polar && /^[0-9a-f-]{36}$/i.test(polar) ? polar.toLowerCase() : null;
+    dodo && /^(pay|sub)_[\w-]{4,64}$/.test(dodo)
+      ? dodo
+      : polar && /^[0-9a-f-]{36}$/i.test(polar)
+        ? polar.toLowerCase()
+        : stripe && /^cs_(test|live)_\w{4,200}$/.test(stripe)
+          ? stripe
+          : null;
   if (!paymentId) return [];
   return [
     db
@@ -284,8 +319,8 @@ function newSession(
       .prepare(
         `INSERT OR IGNORE INTO sessions (site_id, id, visitor_id, started_at, last_seen_at, pageviews, hostname, entry_page, exit_page,
           referrer, referrer_domain, source, channel, utm_source, utm_medium, utm_campaign, utm_term, utm_content, ref,
-          country, region, city, browser, os, device)
-         VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          country, region, city, browser, os, device, lat, lon)
+         VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         site.id,
@@ -312,6 +347,8 @@ function newSession(
         browser,
         os,
         device,
+        geo.lat,
+        geo.lon,
       ),
     // Separate statement so concurrent first events (pageview + goal racing) never double count.
     ...(pageviews

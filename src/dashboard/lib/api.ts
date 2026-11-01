@@ -22,6 +22,14 @@ export async function api<T = any>(path: string, init?: RequestInit & { json?: u
   return data as T;
 }
 
+export interface SiteSpark {
+  id: string;
+  visitors: number;
+  revenue: number;
+  online: number;
+  series: { visitors: number; revenue: number }[];
+}
+
 export interface Site {
   id: string;
   name: string;
@@ -31,6 +39,7 @@ export interface Site {
   api_key: string;
   dodo_webhook_secret: string | null;
   polar_webhook_secret: string | null;
+  stripe_webhook_secret?: string | null;
   polar_access_token: string | null;
   polar_synced_at: number | null;
   created_at: number;

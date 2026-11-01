@@ -210,6 +210,74 @@ await polar({ type: 'order.refunded', data: { ...order('ord_1', {}).data, refund
 const refund = (await call(`/api/sites/${site.id}/visitors/${vp}`)).body.payments.find((p) => p.id === 'ord_1:refund');
 assert(refund && refund.amount === -2500, 'Polar refund recorded net of tax');
 
+// --- Stripe: payment links carry rt_<visitor> in client_reference_id; the success URL carries ?session_id=
+const stripeSecret = 'whsec_' + crypto.randomBytes(24).toString('hex');
+await call(`/api/sites/${site.id}`, { method: 'PATCH', body: JSON.stringify({ stripe_webhook_secret: stripeSecret }) });
+async function stripe(type, object, sign = true) {
+  const body = JSON.stringify({ id: 'evt_' + crypto.randomUUID(), type, data: { object } });
+  const t = Math.floor(Date.now() / 1000);
+  const sig = crypto.createHmac('sha256', stripeSecret).update(`${t}.${body}`).digest('hex');
+  return fetch(`${BASE}/api/webhooks/stripe/${site.id}`, { method: 'POST', headers: { 'stripe-signature': `t=${t},v1=${sign ? sig : 'bad'}` }, body });
+}
+const session = (id, extra) => ({
+  id, object: 'checkout.session', mode: 'payment', payment_status: 'paid', payment_intent: `pi_${id}`, amount_total: 1900, currency: 'usd',
+  created: Math.floor(Date.now() / 1000), customer: `cus_${id}`, customer_details: { email: `${id}@example.com`, name: 'Stripe Buyer' }, metadata: {}, ...extra,
+});
+const vs1 = await visit(site.id, { u: 'https://smoke-test.com/', r: 'https://www.producthunt.com/', who: 'stripe1' });
+assert((await stripe('checkout.session.completed', session('cs_test_a1smoke'), false)).status === 401, 'bad Stripe signature rejected');
+assert((await stripe('checkout.session.completed', session('cs_test_a1smoke', { client_reference_id: `rt_${vs1}` }))).status === 200, 'Stripe checkout accepted');
+let sp = (await call(`/api/sites/${site.id}/customers?period=today`)).body.find((c) => c.id === 'pi_cs_test_a1smoke');
+assert(sp && sp.visitor_id === vs1 && sp.matched_by === 'metadata' && sp.amount === 1900, 'Stripe client_reference_id credits the visitor');
+const vs2 = await visit(site.id, { u: 'https://smoke-test.com/', r: 'https://www.google.com/', who: 'stripe2' });
+await stripe('checkout.session.completed', session('cs_test_b2smoke'));
+await visit(site.id, { u: 'https://smoke-test.com/thanks?session_id=cs_test_b2smoke', r: 'https://checkout.stripe.com/', who: 'stripe2' });
+sp = (await call(`/api/sites/${site.id}/customers?period=today`)).body.find((c) => c.id === 'pi_cs_test_b2smoke');
+assert(sp && sp.visitor_id === vs2 && sp.matched_by === 'return_page', 'Stripe return page (?session_id=) links the payment');
+await stripe('charge.refunded', { id: 'ch_1', payment_intent: 'pi_cs_test_a1smoke', amount_refunded: 1900, currency: 'usd', customer: 'cus_cs_test_a1smoke' });
+const sr = (await call(`/api/sites/${site.id}/visitors/${vs1}`)).body.payments.find((p) => p.id === 'ch_1:refund');
+assert(sr && sr.amount === -1900, 'Stripe refund recorded');
+
+// --- Sparklines and the live globe
+const sparks = (await call('/api/sites-overview?period=24h')).body;
+const mine = sparks.find((x) => x.id === site.id);
+assert(mine && mine.visitors > 0 && mine.series.length === 24, 'sites overview has totals and a 24-bucket sparkline');
+const rt = (await call(`/api/sites/${site.id}/realtime`)).body;
+assert(rt.visitors.length > 0 && rt.feed.some((f) => f.type === 'payment'), 'realtime lists visitors online and recent payments');
+
+// --- Owner visits: a browser that used the dashboard is not counted
+const ownerUa = `${ua} Smoke/owner`;
+await fetch(BASE + '/api/auth/me', { headers: { cookie, 'user-agent': ownerUa } });
+await new Promise((r) => setTimeout(r, 300));
+const ownerHit = await fetch(BASE + '/api/event', { method: 'POST', headers: { 'content-type': 'text/plain', 'user-agent': ownerUa }, body: JSON.stringify({ w: site.id, t: 'pageview', u: 'https://smoke-test.com/' }) });
+assert(ownerHit.status === 202 && (await ownerHit.text()) === '', "the owner's own browser is not counted");
+
+// --- Dodo with several sites on one account: each payment lands on the site whose product it is
+const site2 = (await call('/api/sites', { method: 'POST', body: JSON.stringify({ domain: 'smoke-two.com', name: 'Smoke Two', timezone: 'UTC' }) })).body;
+const secret2Bytes = crypto.randomBytes(24);
+await call(`/api/sites/${site2.id}`, { method: 'PATCH', body: JSON.stringify({ dodo_webhook_secret: 'whsec_' + secret2Bytes.toString('base64') }) });
+async function dodoTo(target, bytes, payload) {
+  const body = JSON.stringify(payload);
+  const id = 'msg_' + crypto.randomUUID();
+  const ts = Math.floor(Date.now() / 1000).toString();
+  const sig = crypto.createHmac('sha256', bytes).update(`${id}.${ts}.${body}`).digest('base64');
+  return (await fetch(`${BASE}/api/webhooks/dodo/${target}`, { method: 'POST', headers: { 'webhook-id': id, 'webhook-timestamp': ts, 'webhook-signature': `v1,${sig}` }, body })).json();
+}
+await visit(site2.id, { u: 'https://smoke-two.com/', who: 'two1' });
+await event(site2.id, { t: 'outbound', u: 'https://smoke-two.com/pricing', n: 'https://checkout.dodopayments.com/buy/pdt_two', who: 'two1' });
+const both = (payment_id, product) => ({ ...pay, data: { ...pay.data, payment_id, metadata: {}, product_cart: [{ product_id: product, quantity: 1 }] } });
+const r1 = await dodoTo(site.id, secretBytes, both('pay_two_1', 'pdt_two'));
+const r2 = await dodoTo(site2.id, secret2Bytes, both('pay_two_1', 'pdt_two'));
+assert(r1.ignored && !r2.ignored && !r2.pending, "a product linked from site two is counted there, not on site one");
+await dodoTo(site.id, secretBytes, both('pay_new_1', 'pdt_new'));
+await dodoTo(site2.id, secret2Bytes, both('pay_new_1', 'pdt_new'));
+let pend = (await call(`/api/sites/${site.id}/pending-payments`)).body;
+assert(pend.length === 1 && pend[0].product_id === 'pdt_new', 'an unknown product waits instead of counting on both sites');
+await call(`/api/sites/${site.id}/pending-payments`, { method: 'POST', body: JSON.stringify({ product_id: 'pdt_new' }) });
+const placed = (await call(`/api/sites/${site.id}/customers?period=today`)).body.some((c) => c.id === 'pay_new_1');
+pend = (await call(`/api/sites/${site2.id}/pending-payments`)).body;
+assert(placed && pend.length === 0, '"Count for" places it on this site and clears the other');
+await call(`/api/sites/${site2.id}`, { method: 'DELETE' });
+
 for (const p of ['today', 'yesterday', '24h', '48h', '7d', '30d', '90d', '12m', 'all']) {
   const res = await call(`/api/sites/${site.id}/overview?period=${p}`);
   assert(res.status === 200 && res.body.series.length > 0, `period ${p} (${res.body.series.length} buckets, ${res.body.range.granularity})`);

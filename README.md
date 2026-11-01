@@ -5,7 +5,7 @@
 **Open-source, cookieless revenue analytics. See which tweet, article, search or AI answer actually made you money.**
 
 RevTrail is a self-hosted DataFast alternative for indie hackers and small SaaS teams. It tracks visitors like Plausible or
-Umami, then links every payment from **Polar** or **Dodo Payments** to the visit that brought the buyer, so your dashboard shows
+Umami, then links every payment from **Polar**, **Dodo Payments** or **Stripe** to the visit that brought the buyer, so your dashboard shows
 revenue by source, not just traffic. It sets no cookies, needs no consent banner, and runs free on your own Cloudflare account.
 
 ![RevTrail dashboard: visitors and revenue over time, revenue by channel, pages, countries and a customer journey list](docs/dashboard.png)
@@ -17,6 +17,8 @@ revenue by source, not just traffic. It sets no cookies, needs no consent banner
 | Revenue by traffic source | Yes | Yes | Revenue goals (custom events) | Revenue report (custom events) | Ecommerce setup |
 | Polar integration | Built in | Yes | No (send events yourself) | No (send events yourself) | No |
 | Dodo Payments integration | Built in | Yes | No (send events yourself) | No (send events yourself) | No |
+| Stripe integration | Built in | Yes | No (send events yourself) | No (send events yourself) | Ecommerce setup |
+| Live visitor map | Yes | Yes | No | No | Realtime report |
 | Cookies / consent banner | None | Cookies | None | None | Cookies, banner |
 | Open source | MIT | No | AGPL | MIT | No |
 | Hosting cost | Free (Cloudflare free plan) | Paid | Paid, or your server | Paid, or your server | Free |
@@ -33,7 +35,11 @@ revenue by source, not just traffic. It sets no cookies, needs no consent banner
 - **Location and tech:** country, region, city, browser, OS and device.
 - **Behaviour:** pages, entry pages, outbound clicks, button clicks and custom goals, and funnels.
 - **Filters everywhere:** click any row to filter the whole dashboard, for example "only visitors from the launch tweet".
-- **Several websites, one login.**
+- **Live map:** press `M` for a real-time globe of who is on the site, with a feed of pages, goals and payments as they
+  happen.
+- **Several websites, one login,** each with a traffic and revenue sparkline on the overview page.
+- **Your own visits don't count:** any browser you opened the dashboard in is left out of the stats.
+- **Remembers your view:** period, filters and tabs stay as you left them.
 - **AI install prompt:** each site's settings page has a prompt you paste into Claude Code or Cursor to install tracking and
   checkout attribution in your codebase.
 
@@ -49,6 +55,9 @@ The tracking script keeps the visitor id in memory only, to tag checkout links o
 
 What this means in practice: a buyer who clicked your tweet and paid within the same month is credited to the tweet; one who
 comes back after the month turns is counted as a new visitor. Payments are still recorded either way.
+
+For the live map, a visit stores the city-level coordinates Cloudflare provides, rounded to about 1 km. To leave out your
+own visits, RevTrail keeps a keyed hash of the IP address and browser you use the dashboard from, for 30 days.
 
 ## Deploy for free (about 10 minutes)
 
@@ -121,6 +130,21 @@ subtracted, and subscription renewals are recognised.
 3. Recommended: set the return URL to a page on your site; Dodo adds `?payment_id=` to it, which links the payment to the
    visitor even without metadata.
 
+Dodo sends every payment in an account to every webhook. When one Dodo account sells on several of your sites, RevTrail
+learns which product belongs to which site from the checkout links on each site's pages and from returning buyers. A payment
+for a product it can't place yet waits in that site's settings, where one click counts it.
+
+## Revenue attribution with Stripe
+
+1. In Stripe, Developers, Webhooks, add `https://YOUR-HOST/api/webhooks/stripe/SITE_ID` and select
+   `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `invoice.paid` and `charge.refunded`. Paste the
+   signing secret into the site's settings.
+2. Stripe payment links (`buy.stripe.com`) on your pages are tagged automatically with `client_reference_id`. For Checkout
+   Sessions created in code, send `window.revtrail.attribution().rt_visitor_id` to your server and add it to the session's
+   metadata as `rt_visitor_id`.
+3. Recommended: end the success URL with `?session_id={CHECKOUT_SESSION_ID}`, which links the payment to the visitor even
+   without metadata. Subscription renewals arrive as `invoice.paid` and are counted as renewals.
+
 ## Any other payment provider
 
 Send payments from your backend with the site's API key:
@@ -135,8 +159,9 @@ curl -X POST https://YOUR-HOST/api/v1/payments -H "Authorization: Bearer rt_..."
 A payment is credited to the buyer's last visit that came from a real source (last non-direct touch), so "clicked a tweet,
 came back directly a week later and paid" is credited to the tweet. RevTrail tries, in order:
 
-1. The visitor id carried by the checkout (`reference_id` for Polar, metadata for Dodo and the API)
-2. A visit to your return page with that payment's id
+1. The visitor id carried by the checkout (`reference_id` for Polar, `client_reference_id` or metadata for Stripe, metadata
+   for Dodo and the API)
+2. A visit to your return page with that payment's id (`?checkout_id=`, `?session_id=` or `?payment_id=`)
 3. An earlier payment by the same customer (renewals)
 4. An email you passed to `identify()`
 5. Timing: used only when exactly one visitor clicked a checkout link in the 3 hours before the payment

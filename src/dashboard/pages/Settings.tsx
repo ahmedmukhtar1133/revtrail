@@ -1,8 +1,11 @@
 import { useEffect, useState, type ReactNode } from 'react';
+import { BackButton } from '../components/BackButton';
 import { navigate } from '../App';
 import { Favicon } from '../components/Icons';
 import { buildAiPrompt } from '../lib/aiPrompt';
+import { currencyDecimals } from '../../shared/currency';
 import { api, type PolarImport, type Site } from '../lib/api';
+import { fmtMoney } from '../lib/format';
 
 function Section({ title, desc, children }: { title: string; desc?: ReactNode; children: ReactNode }) {
   return (
@@ -80,14 +83,13 @@ export function Settings({ siteId }: { siteId: string }) {
   if (!site) return null;
   const snippet = `<script\n  defer\n  data-website-id="${site.id}"\n  src="${origin}/js/script.js"\n></script>`;
   const webhookUrl = `${origin}/api/webhooks/dodo/${site.id}`;
+  const stripeWebhookUrl = `${origin}/api/webhooks/stripe/${site.id}`;
   const polarWebhookUrl = `${origin}/api/webhooks/polar/${site.id}`;
 
   return (
     <div className="mx-auto max-w-3xl space-y-5 px-4 py-8 sm:py-12">
       <div className="flex items-center justify-between">
-        <button className="btn" onClick={() => navigate(`/site/${site.id}`)}>
-          ← Dashboard
-        </button>
+        <BackButton fallback={`/site/${site.id}`} />
         <div className="flex items-center gap-2 font-semibold">
           <Favicon domain={site.domain} size={22} /> {site.name}
         </div>
@@ -127,7 +129,7 @@ async rewrites() {
           </div>
         </details>
         <p className="mt-4 text-sm text-stone-500">
-          Exclude your own visits: open <code>https://{site.domain}/?rt_ignore=true</code> once in each browser you use.
+          Your own visits aren't counted from any browser you've opened this dashboard in during the last 30 days. For other devices, like your phone, open <code>https://{site.domain}/?rt_ignore=true</code> once.
         </p>
       </Section>
 
@@ -274,6 +276,55 @@ const session = await dodo.checkoutSessions.create({
             <b>Recommended:</b> set your product's <b>return / redirect URL</b> in Dodo to a page on your site, e.g.{' '}
             <code>https://{site.domain}/thanks</code>. Dodo adds <code>?payment_id=…</code> to it, which lets RevTrail link the payment to
             the exact visitor even when metadata doesn't come through (for example with payment links).
+          </li>
+        </ol>
+        <PendingDodoPayments site={site} />
+      </Section>
+
+      <Section
+        title="5. Or connect Stripe"
+        desc="Stripe Checkout and payment links: payments are linked to the visitor who paid and credited to the source that brought them."
+      >
+        <ol className="list-decimal space-y-4 pl-5 text-sm">
+          <li>
+            In Stripe → <b>Developers → Webhooks</b>, add this endpoint and select <code>checkout.session.completed</code>,{' '}
+            <code>checkout.session.async_payment_succeeded</code>, <code>invoice.paid</code> and <code>charge.refunded</code>:
+            <div className="mt-2">
+              <Code>{stripeWebhookUrl}</Code>
+            </div>
+          </li>
+          <li>
+            Paste the endpoint's <b>signing secret</b> (starts with <code>whsec_</code>):
+            <div className="mt-2 flex gap-2">
+              <input
+                className="input font-mono"
+                type="password"
+                placeholder="whsec_..."
+                value={form.stripe_webhook_secret ?? ''}
+                onChange={(e) => setForm({ ...form, stripe_webhook_secret: e.target.value })}
+              />
+              <button className="btn-dark" onClick={() => save({ stripe_webhook_secret: form.stripe_webhook_secret ?? '' }, 'Webhook secret saved')}>
+                Save
+              </button>
+            </div>
+            {site.stripe_webhook_secret && <p className="mt-1 text-xs text-emerald-600">✓ Secret configured</p>}
+          </li>
+          <li>
+            <b>Payment links</b> (buy.stripe.com/…) need nothing else: the script adds the visitor as <code>client_reference_id</code>, unless
+            your link already sets one. With <b>Checkout Sessions</b> from your server, send the id from the browser and pass it as metadata:
+            <div className="mt-2">
+              <Code>{`// browser: send window.revtrail.attribution() with the request that starts checkout
+// server:
+await stripe.checkout.sessions.create({
+  // ...
+  metadata: { rt_visitor_id: body.rt_visitor_id },
+});`}</Code>
+            </div>
+          </li>
+          <li>
+            <b>Recommended:</b> end the success URL with <code>?session_id={'{CHECKOUT_SESSION_ID}'}</code>, for example{' '}
+            <code>https://{site.domain}/thanks?session_id={'{CHECKOUT_SESSION_ID}'}</code>. That links the payment to the exact visitor even
+            without metadata.
           </li>
         </ol>
       </Section>
@@ -448,5 +499,55 @@ function LinkBuilder({ domain }: { domain: string }) {
         Shorter alternative: <code>?ref=launch-tweet</code> also works and shows up as the referrer.
       </p>
     </Section>
+  );
+}
+
+interface PendingProduct {
+  product_id: string | null;
+  count: number;
+  amount: number;
+  currency: string | null;
+}
+
+/**
+ * Dodo payments from a product RevTrail couldn't link to any site yet. Rare: one Dodo account on one
+ * site needs nothing, and with several sites most products are learned from checkout links.
+ */
+function PendingDodoPayments({ site }: { site: Site }) {
+  const [rows, setRows] = useState<PendingProduct[]>([]);
+  const load = () => api<PendingProduct[]>(`/api/sites/${site.id}/pending-payments`).then(setRows);
+  useEffect(() => {
+    load();
+  }, [site.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  if (!rows.length) return null;
+  return (
+    <div className="mt-5 rounded-xl border border-revenue/40 bg-revenueSoft p-4 text-sm">
+      <p className="font-medium text-revenueInk">Payments waiting for a site</p>
+      <p className="mt-1 text-stone-700">
+        These came from a Dodo product none of your sites links to yet, so they aren't counted anywhere. They're placed automatically once a
+        buyer comes from {site.name}. Know they're {site.name}'s? Count them now.
+      </p>
+      <ul className="mt-3 space-y-2">
+        {rows.map((r) => {
+          const currency = r.currency ?? site.currency;
+          return (
+            <li key={r.product_id ?? ''} className="flex items-center justify-between gap-3">
+              <span>
+                <code>{r.product_id ?? 'unknown product'}</code>: {r.count} payment{r.count === 1 ? '' : 's'},{' '}
+                {fmtMoney(r.amount, currency, currencyDecimals(currency))}
+              </span>
+              {r.product_id && (
+                <button
+                  className="btn shrink-0"
+                  onClick={() => api(`/api/sites/${site.id}/pending-payments`, { method: 'POST', json: { product_id: r.product_id } }).then(load)}
+                >
+                  Count for {site.name}
+                </button>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
   );
 }

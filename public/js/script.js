@@ -104,7 +104,7 @@
     return vid ? { rt_visitor_id: vid } : {};
   }
   // Checkout links carry the visitor: Dodo as metadata, Polar as reference_id (which Polar keeps on the
-  // checkout). They're tagged as soon as the id is known and whenever links appear, not just on click,
+  // checkout), Stripe payment links as client_reference_id unless the site sets its own. They're tagged as soon as the id is known and whenever links appear, not just on click,
   // because other scripts may copy the href and navigate before our click handler runs.
   function tagLink(a) {
     if (!vid) return;
@@ -112,13 +112,17 @@
       var u = new URL(a.href);
       if (/(^|\.)dodopayments\.com$/.test(u.hostname)) u.searchParams.set('metadata_rt_visitor_id', vid);
       else if (/(^|\.)polar\.sh$/.test(u.hostname)) u.searchParams.set('reference_id', vid);
-      else return;
+      else if (u.hostname === 'buy.stripe.com') {
+        var ref = u.searchParams.get('client_reference_id');
+        if (ref && ref.indexOf('rt_') !== 0) return;
+        u.searchParams.set('client_reference_id', 'rt_' + vid);
+      } else return;
       var next = u.toString();
       if (a.href !== next) a.href = next;
     } catch (e) {}
   }
   function tagLinks() {
-    var links = d.querySelectorAll('a[href*="dodopayments.com"], a[href*="polar.sh"]');
+    var links = d.querySelectorAll('a[href*="dodopayments.com"], a[href*="polar.sh"], a[href*="buy.stripe.com"]');
     for (var i = 0; i < links.length; i++) tagLink(links[i]);
   }
   var tagQueued = false;

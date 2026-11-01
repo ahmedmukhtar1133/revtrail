@@ -23,15 +23,16 @@ export function buildAiPrompt(site: Site, origin: string): string {
 - Keep the exact attributes. Load it once only. Single-page-app navigation is tracked automatically; do not add manual pageview calls.
 - If the project has a Content-Security-Policy, allow ${origin} in script-src and connect-src.
 
-## Task 2: Revenue attribution with Polar or Dodo Payments (most important)
+## Task 2: Revenue attribution with Polar, Dodo Payments or Stripe (most important)
 RevTrail sets no cookies. The server recognises each visitor and the script keeps the visitor id in memory; window.revtrail.attribution() returns { rt_visitor_id } once the first pageview has been recorded. Every payment must carry that id so RevTrail knows which visitor (and therefore which tweet / article / Google page) made the money.
-- Search the codebase for checkout code: "polar.sh", "@polar-sh", "checkouts.create", "dodopayments", "DodoPayments", "checkoutSessions.create", "payments.create", "subscriptions.create", "checkout.dodopayments.com", "/buy/".
-- Static checkout links in the HTML (<a href="https://buy.polar.sh/..."> or <a href="https://checkout.dodopayments.com/buy/...">) need no change: the script tags them automatically (Polar: ?reference_id=<id>, Dodo: ?metadata_rt_visitor_id=<id>). If code redirects to a checkout link with JavaScript (window.location = ...), append the same param yourself using window.revtrail?.attribution?.().rt_visitor_id.
+- Search the codebase for checkout code: "polar.sh", "@polar-sh", "checkouts.create", "dodopayments", "DodoPayments", "checkoutSessions.create", "payments.create", "subscriptions.create", "checkout.dodopayments.com", "/buy/", "stripe", "checkout.sessions.create", "buy.stripe.com".
+- Static checkout links in the HTML (<a href="https://buy.polar.sh/..."> or <a href="https://checkout.dodopayments.com/buy/...">) need no change, and neither do Stripe payment links (<a href="https://buy.stripe.com/...">): the script tags them automatically (Polar: ?reference_id=<id>, Dodo: ?metadata_rt_visitor_id=<id>, Stripe: ?client_reference_id=rt_<id>). If code redirects to a checkout link with JavaScript (window.location = ...), append the same param yourself using window.revtrail?.attribution?.().rt_visitor_id.
 - Where a checkout is created on the SERVER, send the id from the browser in the request that starts the checkout (read it with window.revtrail?.attribution?.()), then MERGE it into the existing metadata (never drop existing metadata keys):
     Polar: metadata: { ...existingMetadata, reference_id: body.rt_visitor_id ?? '' }
     Dodo:  metadata: { ...existingMetadata, rt_visitor_id: body.rt_visitor_id ?? '' }
-- Make sure every checkout returns to a page on this site that loads the RevTrail script, with the payment reference in the URL: Polar success_url 'https://${site.domain}/thanks?checkout_id={CHECKOUT_ID}', Dodo return_url 'https://${site.domain}/thanks' (Dodo appends ?payment_id=...). RevTrail uses that visit to link the payment to the visitor even if metadata is lost. Keep those query params on the URL (don't strip them before the page loads).
-- Do NOT touch payment webhooks in this codebase for RevTrail. I connect them myself in the Polar or Dodo dashboard (Polar: ${origin}/api/webhooks/polar/${site.id}, Dodo: ${origin}/api/webhooks/dodo/${site.id}).
+    Stripe: metadata: { ...existingMetadata, rt_visitor_id: body.rt_visitor_id ?? '' }
+- Make sure every checkout returns to a page on this site that loads the RevTrail script, with the payment reference in the URL: Polar success_url 'https://${site.domain}/thanks?checkout_id={CHECKOUT_ID}', Dodo return_url 'https://${site.domain}/thanks' (Dodo appends ?payment_id=...), Stripe success_url 'https://${site.domain}/thanks?session_id={CHECKOUT_SESSION_ID}'. RevTrail uses that visit to link the payment to the visitor even if metadata is lost. Keep those query params on the URL (don't strip them before the page loads).
+- Do NOT touch payment webhooks in this codebase for RevTrail. I connect them myself in the Polar, Dodo or Stripe dashboard (Polar: ${origin}/api/webhooks/polar/${site.id}, Dodo: ${origin}/api/webhooks/dodo/${site.id}, Stripe: ${origin}/api/webhooks/stripe/${site.id}).
 
 ## Task 3 — Identify logged-in users
 Right after a successful login/signup (and on app load when a user session exists), call:
