@@ -85,7 +85,7 @@ export function makeCtx(c: Context<AppEnv>): Ctx {
 function sessionsWhere(ctx: Ctx, from = ctx.range.from, to = ctx.range.to) {
   const f = filterSql(ctx.filters);
   return {
-    sql: `s.site_id = ? AND s.started_at >= ? AND s.started_at < ?${f.sql}`,
+    sql: `s.site_id = ? AND s.bot IS NULL AND s.started_at >= ? AND s.started_at < ?${f.sql}`,
     params: [ctx.site.id, from, to, ...f.params],
   };
 }
@@ -161,7 +161,7 @@ export async function overview(ctx: Ctx) {
     db.prepare(REVENUE_SQL(curPay.sql)).bind(...curPay.params),
     db.prepare(REVENUE_SQL(prevPay.sql)).bind(...prevPay.params),
     db
-      .prepare('SELECT COUNT(DISTINCT visitor_id) AS n FROM sessions WHERE site_id = ? AND started_at > ? AND last_seen_at > ?')
+      .prepare('SELECT COUNT(DISTINCT visitor_id) AS n FROM sessions WHERE site_id = ? AND bot IS NULL AND started_at > ? AND last_seen_at > ?')
       .bind(site.id, now - 6 * 3_600_000, now - 5 * 60_000),
     db
       .prepare(
@@ -270,7 +270,7 @@ export async function breakdown(ctx: Ctx, dim: string, limit = 100): Promise<Bre
     const f = filterSql(ctx.filters);
     const join = hasFilters(ctx.filters) ? 'JOIN sessions s ON s.site_id = e.site_id AND s.id = e.session_id' : '';
     const params = [ctx.site.id, ctx.range.from, ctx.range.to, ...f.params];
-    const base = `FROM events e ${join} WHERE e.site_id = ? AND e.type = 'pageview' AND e.ts >= ? AND e.ts < ?${f.sql}`;
+    const base = `FROM events e ${join} WHERE e.site_id = ? AND e.bot = 0 AND e.type = 'pageview' AND e.ts >= ? AND e.ts < ?${f.sql}`;
     const [v, r] = await db.batch([
       db
         .prepare(
@@ -296,7 +296,7 @@ export async function breakdown(ctx: Ctx, dim: string, limit = 100): Promise<Bre
     const f = filterSql(ctx.filters);
     const join = hasFilters(ctx.filters) ? 'JOIN sessions s ON s.site_id = e.site_id AND s.id = e.session_id' : '';
     const params = [ctx.site.id, type, ctx.range.from, ctx.range.to, ...f.params];
-    const base = `FROM events e ${join} WHERE e.site_id = ? AND e.type = ? AND e.ts >= ? AND e.ts < ?${f.sql}`;
+    const base = `FROM events e ${join} WHERE e.site_id = ? AND e.bot = 0 AND e.type = ? AND e.ts >= ? AND e.ts < ?${f.sql}`;
     const [v, r] = await db.batch([
       db
         .prepare(
@@ -422,7 +422,7 @@ export async function funnel(ctx: Ctx, steps: FunnelStep[]) {
     await ctx.db
       .prepare(
         `SELECT e.visitor_id AS v, e.ts, e.type, e.name, e.path FROM events e ${join}
-         WHERE e.site_id = ? AND e.ts >= ? AND e.ts < ? AND (${conds.join(' OR ')})${f.sql}
+         WHERE e.site_id = ? AND e.bot = 0 AND e.ts >= ? AND e.ts < ? AND (${conds.join(' OR ')})${f.sql}
          ORDER BY e.ts LIMIT 100000`,
       )
       .bind(ctx.site.id, ctx.range.from, ctx.range.to, ...params, ...f.params)
@@ -477,19 +477,19 @@ export async function sparklines(db: D1Database, siteIds: string[], period: stri
 
   const [totals, pay, online, vs, rs] = await db.batch([
     db
-      .prepare(`SELECT site_id, COUNT(DISTINCT visitor_id) AS v FROM sessions WHERE site_id IN (${ids}) AND started_at >= ? GROUP BY site_id`)
+      .prepare(`SELECT site_id, COUNT(DISTINCT visitor_id) AS v FROM sessions WHERE site_id IN (${ids}) AND bot IS NULL AND started_at >= ? GROUP BY site_id`)
       .bind(...siteIds, from),
     db.prepare(`SELECT site_id, SUM(amount) AS r FROM payments WHERE site_id IN (${ids}) AND ts >= ? GROUP BY site_id`).bind(...siteIds, from),
     db
       .prepare(
         `SELECT site_id, COUNT(DISTINCT visitor_id) AS n FROM sessions
-         WHERE site_id IN (${ids}) AND started_at > ? AND last_seen_at > ? GROUP BY site_id`,
+         WHERE site_id IN (${ids}) AND bot IS NULL AND started_at > ? AND last_seen_at > ? GROUP BY site_id`,
       )
       .bind(...siteIds, now - 6 * 3_600_000, now - 5 * 60_000),
     db
       .prepare(
         `SELECT site_id, ${bucket('started_at')} AS b, COUNT(DISTINCT visitor_id) AS v FROM sessions
-         WHERE site_id IN (${ids}) AND started_at >= ? GROUP BY site_id, b`,
+         WHERE site_id IN (${ids}) AND bot IS NULL AND started_at >= ? GROUP BY site_id, b`,
       )
       .bind(...siteIds, from),
     db
@@ -524,7 +524,7 @@ export async function realtime(db: D1Database, site: Site, now = Date.now()) {
                 v.name, v.email,
                 (SELECT COALESCE(SUM(amount), 0) FROM payments p WHERE p.site_id = s.site_id AND p.visitor_id = s.visitor_id) AS spent
          FROM sessions s LEFT JOIN visitors v ON v.site_id = s.site_id AND v.id = s.visitor_id
-         WHERE s.site_id = ? AND s.started_at > ? AND s.last_seen_at > ?
+         WHERE s.site_id = ? AND s.bot IS NULL AND s.started_at > ? AND s.last_seen_at > ?
          ORDER BY s.last_seen_at DESC LIMIT 500`,
       )
       .bind(site.id, now - 6 * 3_600_000, now - ACTIVE_MS),
@@ -534,7 +534,7 @@ export async function realtime(db: D1Database, site: Site, now = Date.now()) {
          FROM events e
          LEFT JOIN sessions s ON s.site_id = e.site_id AND s.id = e.session_id
          LEFT JOIN visitors v ON v.site_id = e.site_id AND v.id = e.visitor_id
-         WHERE e.site_id = ? AND e.ts > ? AND e.type IN ('pageview', 'goal')
+         WHERE e.site_id = ? AND e.bot = 0 AND e.ts > ? AND e.type IN ('pageview', 'goal')
          ORDER BY e.ts DESC LIMIT 100`,
       )
       .bind(site.id, now - FEED_MS),

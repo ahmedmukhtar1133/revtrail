@@ -1,6 +1,7 @@
 import type { Context } from 'hono';
 import { classify } from '../shared/sources';
 import { getSite, type AppEnv, type Site } from './env';
+import { datacenterReason } from './lib/network';
 import { isBot, parseUA } from './lib/ua';
 import { isOwnerVisit } from './owner';
 import { sessionId, visitorId } from './lib/visitor';
@@ -79,9 +80,19 @@ export async function handleEvent(c: Context<AppEnv>) {
   const now = Date.now();
   body.vid = await visitorId(c.env.DB, site.id, clientIp(c), ua, now);
   body.sid = (await sessionId(c.env.DB, site.id, body.vid, now)).id;
-  await ingest(c.env.DB, site, body, url, ua, geoOf(c), now);
+  await ingest(c.env.DB, site, body, url, ua, geoOf(c), now, botReason(c));
   // The tracker keeps the visitor id in memory only, to tag checkout links on this page.
   return c.json({ v: body.vid }, 202);
+}
+
+/**
+ * Set when the request came from a hosting provider's network, so a headless browser pretending to be
+ * Chrome is kept out of the stats. Not possible behind a proxy (Vercel), where the network is the proxy's.
+ */
+export function botReason(c: Context<AppEnv>): string | null {
+  if (c.req.header('x-vercel-ip-country')) return null;
+  const cf = (c.req.raw as { cf?: IncomingRequestCfProperties }).cf;
+  return datacenterReason(cf?.asn, cf?.asOrganization);
 }
 
 /** The visitor's IP address, used only inside the visitor hash and never stored. */
@@ -148,6 +159,7 @@ export async function ingest(
   ua: string,
   geo: Geo,
   now: number,
+  bot: string | null = null,
 ) {
   const path = normalizePath(url.pathname);
   const { t, vid, sid } = body;
@@ -181,7 +193,7 @@ export async function ingest(
 
   const stmts: D1PreparedStatement[] = [];
   if (!existing) {
-    stmts.push(...newSession(db, site, body, url, path, ua, geo, now));
+    stmts.push(...newSession(db, site, body, url, path, ua, geo, now, bot));
   }
 
   if (t === 'pageview') {
@@ -192,7 +204,7 @@ export async function ingest(
           .bind(path, now, site.id, sid),
       );
     }
-    stmts.push(insertEvent(db, site.id, sid, vid, now, 'pageview', null, path, null));
+    stmts.push(insertEvent(db, site.id, sid, vid, now, 'pageview', null, path, null, bot));
     stmts.push(...claimPayment(db, site.id, vid, url, now));
   } else if (t === 'goal') {
     const name = clip(body.n, 64);
@@ -200,14 +212,14 @@ export async function ingest(
     const props = body.p && typeof body.p === 'object' ? JSON.stringify(body.p).slice(0, 1000) : null;
     stmts.push(
       db.prepare('UPDATE sessions SET goals = goals + 1, last_seen_at = ? WHERE site_id = ? AND id = ?').bind(now, site.id, sid),
-      insertEvent(db, site.id, sid, vid, now, 'goal', name, path, props),
+      insertEvent(db, site.id, sid, vid, now, 'goal', name, path, props, bot),
     );
   } else if (t === 'outbound') {
     const target = clip(body.n, 500);
     if (!target) return;
     stmts.push(
       db.prepare('UPDATE sessions SET last_seen_at = ? WHERE site_id = ? AND id = ?').bind(now, site.id, sid),
-      insertEvent(db, site.id, sid, vid, now, 'outbound', target, path, null),
+      insertEvent(db, site.id, sid, vid, now, 'outbound', target, path, null, bot),
     );
   }
   await db.batch(stmts);
@@ -268,10 +280,11 @@ function insertEvent(
   name: string | null,
   path: string,
   props: string | null,
+  bot: string | null,
 ) {
   return db
-    .prepare('INSERT INTO events (site_id, session_id, visitor_id, ts, type, name, path, props) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .bind(siteId, sid, vid, ts, type, name, path, props);
+    .prepare('INSERT INTO events (site_id, session_id, visitor_id, ts, type, name, path, props, bot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind(siteId, sid, vid, ts, type, name, path, props, bot ? 1 : 0);
 }
 
 function newSession(
@@ -283,6 +296,7 @@ function newSession(
   ua: string,
   geo: Geo,
   now: number,
+  bot: string | null,
 ): D1PreparedStatement[] {
   let referrer: string | null = null;
   let referrerDomain: string | null = null;
@@ -319,8 +333,8 @@ function newSession(
       .prepare(
         `INSERT OR IGNORE INTO sessions (site_id, id, visitor_id, started_at, last_seen_at, pageviews, hostname, entry_page, exit_page,
           referrer, referrer_domain, source, channel, utm_source, utm_medium, utm_campaign, utm_term, utm_content, ref,
-          country, region, city, browser, os, device, lat, lon)
-         VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          country, region, city, browser, os, device, lat, lon, bot)
+         VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         site.id,
@@ -349,6 +363,7 @@ function newSession(
         device,
         geo.lat,
         geo.lon,
+        bot,
       ),
     // Separate statement so concurrent first events (pageview + goal racing) never double count.
     ...(pageviews

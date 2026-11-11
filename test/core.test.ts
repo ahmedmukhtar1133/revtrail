@@ -6,6 +6,7 @@ import type { Site } from '../src/worker/env';
 import { verifyPolarWebhook, verifyStandardWebhook, verifyStripeWebhook } from '../src/worker/lib/crypto';
 import { dodoProductOfLink, polarOrderPayment } from '../src/worker/payments';
 import { bucketLabels, resolveRange, startOfDay, tzOffset } from '../src/worker/lib/time';
+import { datacenterReason } from '../src/worker/lib/network';
 import { isBot, parseUA } from '../src/worker/lib/ua';
 
 describe('classify', () => {
@@ -180,5 +181,21 @@ describe('dodo products', () => {
   it('reads the product of a checkout link', () => {
     expect(dodoProductOfLink('https://checkout.dodopayments.com/buy/pdt_abc123?quantity=1')).toBe('pdt_abc123');
     expect(dodoProductOfLink('https://polar.sh/checkout/x')).toBeNull();
+  });
+});
+
+describe('datacenter traffic', () => {
+  it('flags hosting providers by ASN or name', () => {
+    expect(datacenterReason(16509, 'Amazon.com, Inc.')).toMatch(/^datacenter: AS16509/);
+    expect(datacenterReason(45090, 'Tencent Building, Kejizhongyi Avenue')).not.toBeNull();
+    expect(datacenterReason(99999, 'Hetzner Online GmbH')).not.toBeNull();
+    expect(datacenterReason('15169', 'Google LLC')).not.toBeNull();
+  });
+  it('leaves homes, offices, mobile networks and relays alone', () => {
+    expect(datacenterReason(3320, 'Deutsche Telekom AG')).toBeNull();
+    expect(datacenterReason(16591, 'Google Fiber Inc.')).toBeNull();
+    expect(datacenterReason(13335, 'Cloudflare, Inc.')).toBeNull();
+    expect(datacenterReason(36183, 'Akamai Technologies, Inc.')).toBeNull();
+    expect(datacenterReason(undefined, undefined)).toBeNull();
   });
 });
